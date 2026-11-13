@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="bg">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Колаборативно рисуване</title>
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<style>
+  :root { --bg:#f4f4f6; --fg:#1d1d22; --card:#fff; --accent:#4f46e5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#1a1a1f; --fg:#eee; --card:#26262d; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, sans-serif; background:var(--bg); color:var(--fg);
+         display:flex; flex-direction:column; height:100vh; height:100dvh; }
+  header { padding:8px 12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; background:var(--card); }
+  input, button { font:inherit; padding:6px 10px; border-radius:8px; border:1px solid #8884; background:var(--bg); color:var(--fg); }
+  button { cursor:pointer; background:var(--accent); color:#fff; border:none; }
+  button.alt { background:#8885; color:var(--fg); }
+  input[type=color] { padding:0; width:40px; height:34px; }
+  #code { width:110px; text-transform:uppercase; }
+  #status { font-size:14px; margin-left:auto; }
+  #tools { display:none; gap:8px; align-items:center; flex-wrap:wrap; }
+  main { flex:1; display:flex; align-items:center; justify-content:center; padding:8px; min-height:0; }
+  canvas { background:#fff; border-radius:10px; box-shadow:0 2px 10px #0003; touch-action:none;
+           max-width:100%; max-height:100%; aspect-ratio:10/7; width:auto; height:auto; }
+</style>
+</head>
+<body>
+<header>
+  <div id="join">
+    <input id="code" maxlength="8" placeholder="Код на стая">
+    <button id="go">Влез / създай стая</button>
+  </div>
+  <div id="tools">
+    <input type="color" id="color" value="#4f46e5">
+    <input type="range" id="size" min="2" max="30" value="5">
+    <button class="alt" id="eraser">Гумичка</button>
+    <button class="alt" id="clear">Изчисти</button>
+  </div>
+  <span id="status">Не си свързан</span>
+</header>
+<main><canvas id="cv" width="1000" height="700"></canvas></main>
+
+<script>
+const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+const $ = id => document.getElementById(id);
+ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+
+let peer, isHost = false, hostConn = null, conns = [], history = [], connected = false;
+let color = '#4f46e5', erasing = false;
+
+$('code').value = Math.random().toString(36).slice(2, 6).toUpperCase();
+$('color').oninput = e => { color = e.target.value; erasing = false; };
+$('eraser').onclick = () => { erasing = !erasing; $('eraser').textContent = erasing ? 'Рисуване' : 'Гумичка'; };
+$('clear').onclick = () => { if (confirm('Да изчистя ли за всички?')) { applyClear(); send({t:'clear'}); } };
+
+function setStatus(s) { $('status').textContent = s; }
+
+// ---------- Връзка ----------
+$('go').onclick = () => {
+  const code = $('code').value.trim().toUpperCase();
+  if (!code) return;
+  $('go').disabled = true;
+  setStatus('Свързване...');
+  // Първо опитваме да бъдем домакин на стаята
+  peer = new Peer('cdraw-' + code);
+  peer.on('open', () => { isHost = true; startHost(code); });
+  peer.on('error', err => {
+    if (err.type === 'unavailable-id') {
+      // стаята съществува -> влизаме като гост
+      peer.destroy();
+      peer = new Peer();
+      peer.on('open', () => startGuest(code));
+      peer.on('error', e => fail(e));
+    } else fail(err);
+  });
+};
+
+function fail(err) {
+  setStatus('Грешка: ' + (err.type || err));
+  $('go').disabled = false;
+}
+
+function startHost(code) {
+  showApp();
+  setStatus('Ти си домакин на стая ' + code + ' (1 устройство)');
+  peer.on('connection', c => {
+    c.on('open', () => {
+      conns.push(c);
+      c.send({t:'hist', h:history});
+      broadcastCount();
+    });
+    c.on('data', d => { handle(d); relay(d, c); });
+    c.on('close', () => { conns = conns.filter(x => x !== c); broadcastCount(); });
+  });
+}
+
+function startGuest(code) {
+  hostConn = peer.connect('cdraw-' + code, {reliable:true});
+  hostConn.on('open', () => { showApp(); setStatus('Свързан към стая ' + code); });
+  hostConn.on('data', handle);
+  hostConn.on('close', () => { setStatus('Домакинът излезе. Презареди страницата.'); connected = false; });
+  hostConn.on('error', fail);
+}
+
+function showApp() {
+  connected = true;
+  $('join').style.display = 'none';
+  $('tools').style.display = 'flex';
+}
+
+function broadcastCount() {
+  const n = conns.length + 1;
+  setStatus('Стая ' + $('code').value.toUpperCase() + ' — устройства: ' + n);
+  relay({t:'n', n}, null);
+}
+
+// Изпращане: домакинът праща на всички, гостът – към домакина
+function send(d) {
+  if (isHost) relay(d, null);
+  else if (hostConn && hostConn.open) hostConn.send(d);
+}
+function relay(d, except) {
+  conns.forEach(c => { if (c !== except && c.open) c.send(d); });
+}
+
+// Получени съобщения
+function handle(d) {
+  if (d.t === 'l') { drawLine(d); history.push(d); }
+  else if (d.t === 'clear') applyClear();
+  else if (d.t === 'hist') { d.h.forEach(l => { drawLine(l); history.push(l); }); }
+  else if (d.t === 'n') setStatus('Стая ' + $('code').value.toUpperCase() + ' — устройства: ' + d.n);
+}
+
+// ---------- Рисуване ----------
+function drawLine(l) {
+  ctx.strokeStyle = l.c; ctx.lineWidth = l.w;
+  ctx.beginPath();
+  ctx.moveTo(l.x0 * cv.width, l.y0 * cv.height);
+  ctx.lineTo(l.x1 * cv.width, l.y1 * cv.height);
+  ctx.stroke();
+}
+function applyClear() { ctx.clearRect(0, 0, cv.width, cv.height); history = []; }
+
+function pos(e) {
+  const r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width, y: (e.clientY - r.top) / r.height };
+}
+
+let last = null;
+cv.addEventListener('pointerdown', e => { if (!connected) return; cv.setPointerCapture(e.pointerId); last = pos(e); });
+cv.addEventListener('pointermove', e => {
+  if (!last) return;
+  const p = pos(e);
+  const l = { t:'l', x0:last.x, y0:last.y, x1:p.x, y1:p.y,
+              c: erasing ? '#ffffff' : color, w: +$('size').value * (erasing ? 3 : 1) };
+  drawLine(l); history.push(l); send(l);
+  last = p;
+});
+['pointerup', 'pointercancel'].forEach(ev => cv.addEventListener(ev, () => last = null));
+</script>
+</body>
+</html>
